@@ -244,8 +244,8 @@ function buildArgs(src, fmt, info, videoCodec, start, end, accurate) {
 
   if (isAudioFormat(fmt)) {
     // ─── Audio output ──────────────────────────────────────────────────
-    args.push('-ss', start);
     args.push('-i', JSON.stringify(src));
+    args.push('-ss', start);
     args.push('-to', end);
     args.push('-vn'); // always strip video for audio output
 
@@ -265,14 +265,14 @@ function buildArgs(src, fmt, info, videoCodec, start, end, accurate) {
 
     if (container === 'mkv') {
       // MKV: everything is compatible
-      args.push('-ss', start);
       args.push('-i', JSON.stringify(src));
+      args.push('-ss', start);
       args.push('-to', end);
       args.push('-c', 'copy');
     } else if (accurate) {
       // Frame-accurate: full re-encode
-      args.push('-ss', start);
       args.push('-i', JSON.stringify(src));
+      args.push('-ss', start);
       args.push('-to', end);
       args.push('-c:v', videoCodec);
       args.push('-c:a', 'aac');
@@ -281,8 +281,8 @@ function buildArgs(src, fmt, info, videoCodec, start, end, accurate) {
       const vOk = isCompat(container, 'video', info.videoCodec);
       const aOk = isCompat(container, 'audio', info.audioCodec);
 
-      args.push('-ss', start);
       args.push('-i', JSON.stringify(src));
+      args.push('-ss', start);
       args.push('-to', end);
 
       if (vOk && aOk) {
