@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import { execSync } from 'child_process';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'fs';
 import { dirname, basename, extname, join } from 'path';
+import { tmpdir } from 'os';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -60,6 +61,49 @@ const AUDIO_ENCODER = {
   flac: 'flac',
   opus: 'libopus',
 };
+
+// ─── M3U8 helpers ──────────────────────────────────────────────
+
+function timeToSeconds(ts) {
+  const parts = ts.split(':').map(Number);
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return Number(parts[0]) || 0;
+}
+
+function formatTime(sec) {
+  sec = Math.max(0, sec);
+  const h = Math.floor(sec / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  const s = Math.floor(sec % 60);
+  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+}
+
+function fetchM3U8Sync(url) {
+  const text = execSync(`curl -sL ${JSON.stringify(url)}`, {
+    encoding: 'utf-8', timeout: 30000,
+  });
+  return text;
+}
+
+function parseM3U8(text) {
+  const headerLines = [];
+  const segments = [];
+  let currentDuration = 0;
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith('#')) {
+      const m = trimmed.match(/^#EXTINF:([\d.]+)/);
+      if (m) currentDuration = parseFloat(m[1]);
+      if (!trimmed.startsWith('#EXTINF') && trimmed !== '#EXTM3U') headerLines.push(trimmed);
+    } else {
+      segments.push({ url: trimmed, duration: currentDuration });
+      currentDuration = 0;
+    }
+  }
+  return { headerLines, segments };
+}
 
 // ─── ffprobe ────────────────────────────────────────────────────────────────
 
@@ -123,7 +167,7 @@ function main() {
   let totalFail = 0;
 
   for (const job of jobs) {
-    if (!job.input || !existsSync(job.input)) {
+    if (!job.input || (!job.isM3U8 && !existsSync(job.input))) {
       console.error(`\nInput file not found: ${job.input}`);
       totalFail += (job.clips || []).length;
       continue;
@@ -145,11 +189,40 @@ function main() {
 
 function runJob(job) {
   const src = job.input;
-  const srcDir = dirname(src);
-  const srcBase = basename(src);
+  const isM3U8 = job.isM3U8 === true;
+  const srcBase = basename(job.input);
   const defaultFormat = job.defaultFormat || 'mp4';
   const videoCodec = job.videoCodec || 'libx264';
   const clips = job.clips;
+
+  const member = job.member || null;
+  const broadcastTime = job.broadcastTime || null;
+  const outDir = job.outDir || null;
+
+  // ── Output base directory ───────────────────────────────────────────────
+  let srcDir;
+  if (member && broadcastTime) {
+    srcDir = join(outDir || process.cwd(), member, broadcastTime);
+    if (!existsSync(srcDir)) mkdirSync(srcDir, { recursive: true });
+  } else {
+    srcDir = dirname(job.input);
+  }
+
+  // ── M3U8: fetch + parse once ────────────────────────────────
+  let m3u8Segments = null;
+  let m3u8BaseUrl = null;
+  let m3u8Origin = null;
+
+  if (isM3U8) {
+    console.log(`\n━━━ ${srcBase} ━━━\n  解析M3U8分片列表…`);
+    const text = fetchM3U8Sync(src);
+    const parsed = parseM3U8(text);
+    m3u8Segments = parsed.segments;
+    const u = new URL(src);
+    m3u8Origin = u.origin;
+    m3u8BaseUrl = src.substring(0, src.lastIndexOf('/') + 1);
+    console.log(`  共 ${m3u8Segments.length} 个分片`);
+  }
 
   console.log(`\n━━━ ${srcBase} ━━━`);
 
@@ -157,9 +230,17 @@ function runJob(job) {
 
   const info = probe(src);
   if (info.error) {
-    console.error(`  ${info.error}`);
-    for (const c of clips) c._ok = false;
-    return;
+    if (isM3U8) {
+      console.log(`  ffprobe探测失败，默认H.264+AAC`);
+      info.videoCodec = 'h264';
+      info.audioCodec = 'aac';
+      info.hasVideo = true;
+      info.hasAudio = true;
+    } else {
+      console.error(`  ${info.error}`);
+      for (const c of clips) c._ok = false;
+      return;
+    }
   }
   console.log(`  视频编码: ${info.videoCodec || '—'}  音频编码: ${info.audioCodec || '—'}`);
 
@@ -197,11 +278,54 @@ function runJob(job) {
     const tag = `[${i + 1}/${clips.length}] ${clip.name || `clip_${i}`}`;
     process.stdout.write(`  ${tag} (${fmt}) … `);
 
+    // ── Per-clip source ───────────────────────────────────────────────
+    let clipSrc = src;
+    let clipStart = clip.start;
+    let clipEnd = clip.end;
+    let clipProtoWhitelist = '';
+
+    if (isM3U8 && m3u8Segments) {
+      const padding = 10;
+      const globalStart = Math.max(0, timeToSeconds(clip.start) - padding);
+      const globalEnd = timeToSeconds(clip.end) + padding;
+
+      let cum = 0;
+      const selected = [];
+      for (const seg of m3u8Segments) {
+        const segEnd = cum + seg.duration;
+        if (segEnd > globalStart && cum < globalEnd) selected.push(seg);
+        cum = segEnd;
+        if (cum > globalEnd) break;
+      }
+
+      let output = '#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGET-DURATION:10\n#EXT-X-MEDIA-SEQUENCE:0\n';
+      for (const seg of selected) {
+        let segUrl;
+        if (seg.url.startsWith('http')) {
+          segUrl = seg.url;
+        } else if (seg.url.startsWith('/')) {
+          segUrl = m3u8Origin + seg.url;
+        } else {
+          segUrl = m3u8BaseUrl + seg.url;
+        }
+        output += `#EXTINF:${seg.duration.toFixed(3)},\n${segUrl}\n`;
+      }
+      output += '#EXT-X-ENDLIST\n';
+
+      const tmpFile = join(tmpdir(), `sub_m3u8_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.m3u8`);
+      writeFileSync(tmpFile, output, 'utf-8');
+
+      clipSrc = tmpFile;
+      clipStart = formatTime(timeToSeconds(clip.start) - globalStart);
+      clipEnd = formatTime(timeToSeconds(clip.end) - globalStart);
+      clipProtoWhitelist = '-protocol_whitelist file,crypto,data,https,tls,tcp,http ';
+    }
+
     try {
-      const args = buildArgs(src, fmt, info, videoCodec, clip.start, clip.end, accurate);
+      const args = buildArgs(clipSrc, fmt, info, videoCodec, clipStart, clipEnd, accurate);
       args.push(JSON.stringify(outPath));
 
-      execSync(`ffmpeg -y ${args.join(' ')}`, {
+      execSync(`ffmpeg -y ${clipProtoWhitelist}${args.join(' ')}`, {
         encoding: 'utf-8',
         timeout: 600_000,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -213,14 +337,21 @@ function runJob(job) {
     } catch (e) {
       console.log(`❌`);
       clip._ok = false;
-      failures.push({ name: clip.name || `clip_${i}`, start: clip.start, end: clip.end, format: fmt, error: e.stderr?.toString()?.slice(0, 300) || e.message });
+      const errMsg = e.stderr?.toString() || '';
+      const shortErr = errMsg.length > 500 ? '...' + errMsg.slice(-500) : errMsg;
+      failures.push({ name: clip.name || `clip_${i}`, start: clip.start, end: clip.end, format: fmt, error: shortErr || e.message });
+    } finally {
+      if (isM3U8 && clipSrc !== src) {
+        rmSync(clipSrc);
+      }
     }
   }
 
   // ── Generate _clip_record.txt ──────────────────────────────────────────
 
   const recordPath = join(srcDir, '_clip_record.txt');
-  let record = `--- 批量裁剪记录 ---\n源文件: ${srcBase}\n\n`;
+  const recordSrc = (member && broadcastTime) ? `[口袋48录播] ${member} ${broadcastTime}` : srcBase;
+  let record = `--- 批量裁剪记录 ---\n源文件: ${recordSrc}\n\n`;
 
   for (const r of results) {
     record += `名称: ${r.name}\n开始: ${r.start}\n结束: ${r.end}\n\n`;
